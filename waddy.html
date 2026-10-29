@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <title>made by waddy</title>
+  <style>
+    /* 全体のスタイル設定 */
+    html,
+    body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      /* スマホでのスクロール・引っ張って更新・ピンチズームを抑止 */
+      overscroll-behavior: none;
+      touch-action: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    body {
+      background-color: #0b0f19;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+      min-height: 100dvh; /* iOSのアドレスバー変動に対応 */
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    /* ゲーム画面のコンテナ */
+    .game-container {
+      position: relative;
+      /* 縦横比 480:640 を保ったまま画面に収める */
+      width: min(480px, 100vw, calc(100dvh * 480 / 640));
+      aspect-ratio: 480 / 640;
+    }
+
+    /* ゲーム描画用のCanvas */
+    canvas {
+      background-color: #050811;
+      display: block;
+      width: 100%;
+      height: 100%;
+      border-radius: 8px;
+      /* borderではなくbox-shadowで枠を描き、サイズやタッチ座標の計算に影響させない */
+      box-shadow: 0 0 0 2px #334155, 0 0 24px rgba(0, 0, 0, 0.8);
+      touch-action: none;
+    }
+
+    /* 画面右下の作者クレジット */
+    .credit {
+      position: absolute;
+      right: 12px;
+      bottom: 8px;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.5);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="game-container">
+    <canvas id="gameCanvas" width="480" height="640"></canvas>
+    <!-- 右下にニックネームを表示 -->
+    <div class="credit">made by waddy</div>
+  </div>
+
+  <script>
+    // キャンバスと描画コンテキストの取得
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // ゲーム状態定数
+    const STATE_PLAYING = 'playing';
+    const STATE_GAMEOVER = 'gameover';
+    const STATE_CLEAR = 'clear';
+
+    // ゲーム管理変数
+    let gameState = STATE_PLAYING;
+    let gameTime = 0; // 経過時間（秒）
+    const MAX_TIME = 30.0; // 制限時間（30秒）
+    let lastTimestamp = performance.now();
+
+    // 自機の設定
+    const player = {
+      width: 28,
+      height: 28,
+      x: (canvas.width - 28) / 2,
+      y: canvas.height - 60,
+      speed: 5,
+      hitRadius: 4 // 当たり判定の半径（中央のコア）
+    };
+
+    // 敵ボスの設定
+    const boss = {
+      x: canvas.width / 2,
+      y: 90,
+      width: 50,
+      height: 30,
+      vx: 2
+    };
+
+    // 配列管理
+    let playerBullets = [];
+    let enemyBullets = [];
+    let particles = [];
+    let confetti = [];
+    let fireworks = [];
+
+    // 弾幕パターンのタイマー・カウンタ
+    let shootTimer = 0;
+    let spiralAngle = 0;
+    let playerShootCooldown = 0;
+
+    // タッチ操作の状態
+    let autoFire = false;   // 一度タッチしたら自動連射に切り替え
+    let dragging = false;
+    let dragStartX = 0;
+    let dragStartPlayerX = 0;
+    const DRAG_GAIN = 1.6;  // 指の移動量に対する自機の移動倍率
+
+    // キー入力状態
+    const keys = {
+      ArrowLeft: false,
+      ArrowRight: false,
+      Space: false
+    };
+
+    // キーイベントリスナー
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowLeft') keys.ArrowLeft = true;
+      if (e.key === 'ArrowRight') keys.ArrowRight = true;
+      if (e.code === 'Space') {
+        keys.Space = true;
+        e.preventDefault();
+      }
+      if (e.key === 'Enter') {
+        initGame(); // Enterキーでいつでもリトライ
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (e.key === 'ArrowLeft') keys.ArrowLeft = false;
+      if (e.key === 'ArrowRight') keys.ArrowRight = false;
+      if (e.code === 'Space') keys.Space = false;
+    });
+
+    // クライアント座標 → Canvas内座標（CSSで拡大縮小されていても正しく変換）
+    function canvasX(clientX) {
+      const rect = canvas.getBoundingClientRect();
+      return (clientX - rect.left) * (canvas.width / rect.width);
+    }
+
+    // タッチ／マウス共通の操作（ドラッグで左右移動、タップでリトライ）
+    canvas.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      if (e.pointerType !== 'mouse') autoFire = true; // スマホは自動連射
+
+      // プレイ中以外はタップでリスタート
+      if (gameState !== STATE_PLAYING) {
+        initGame();
+        return;
+      }
+
+      try {
+        canvas.setPointerCapture(e.pointerId);
+      } catch (err) {
+        // 一部環境でポインタIDが無効な場合があるが、操作自体は継続できる
+      }
+      dragging = true;
+      dragStartX = canvasX(e.clientX);
+      dragStartPlayerX = player.x;
+    });
+
+    canvas.addEventListener('pointermove', (e) => {
+      if (!dragging || gameState !== STATE_PLAYING) return;
+      e.preventDefault();
+
+      // 指の移動量（相対値）で動かすことで、指の下に自機が隠れるのを防ぐ
+      const dx = canvasX(e.clientX) - dragStartX;
+      const nextX = dragStartPlayerX + dx * DRAG_GAIN;
+      player.x = Math.max(0, Math.min(canvas.width - player.width, nextX));
+    });
+
+    canvas.addEventListener('pointerup', () => { dragging = false; });
+    canvas.addEventListener('pointercancel', () => { dragging = false; });
+
+    // ゲーム初期化（リスタート処理）
+    function initGame() {
+      gameState = STATE_PLAYING;
+      gameTime = 0;
+      lastTimestamp = performance.now();
+      player.x = (canvas.width - player.width) / 2;
+      player.y = canvas.height - 60;
+      boss.x = canvas.width / 2;
+      playerBullets = [];
+      enemyBullets = [];
+      particles = [];
+      confetti = [];
+      fireworks = [];
+      shootTimer = 0;
+      spiralAngle = 0;
+      playerShootCooldown = 0;
+      dragging = false;
+    }
+
+    // 敵の弾を発射する関数
+    function spawnEnemyBullet(x, y, vx, vy, color, radius = 5) {
+      enemyBullets.push({ x, y, vx, vy, color, radius });
+    }
+
+    // 花火エフェクトの発生
+    function spawnFirework() {
+      const fx = 60 + Math.random() * (canvas.width - 120);
+      const fy = 80 + Math.random() * 260;
+      const count = 40;
+      const hue = Math.floor(Math.random() * 360);
+      for (let i = 0; i < count; i++) {
+        const angle = (Math.PI * 2 * i) / count;
+        const speed = 2 + Math.random() * 3.5;
+        fireworks.push({
+          x: fx,
+          y: fy,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed,
+          color: `hsl(${hue}, 100%, 60%)`,
+          alpha: 1.0,
+          decay: 0.015 + Math.random() * 0.015
+        });
+      }
+    }
+
+    // 紙吹雪エフェクトの発生
+    function spawnConfettiBatch() {
+      for (let i = 0; i < 6; i++) {
+        confetti.push({
+          x: Math.random() * canvas.width,
+          y: -10,
+          vx: (Math.random() - 0.5) * 2,
+          vy: 2 + Math.random() * 3,
+          rot: Math.random() * 360,
+          rotSpeed: (Math.random() - 0.5) * 10,
+          w: 8 + Math.random() * 6,
+          h: 12 + Math.random() * 6,
+          color: `hsl(${Math.random() * 360}, 90%, 65%)`
+        });
+      }
+    }
+
+    // ゲーム更新処理
+    function update(dt) {
+      // 祝宴エフェクト更新（クリア時）
+      if (gameState === STATE_CLEAR) {
+        spawnConfettiBatch();
+        if (Math.random() < 0.08) spawnFirework();
+
+        // 花火粒子の移動
+        for (let i = fireworks.length - 1; i >= 0; i--) {
+          const f = fireworks[i];
+          f.x += f.vx;
+          f.y += f.vy;
+          f.vy += 0.04; // 重力
+          f.alpha -= f.decay;
+          if (f.alpha <= 0) fireworks.splice(i, 1);
+        }
+
+        // 紙吹雪の移動
+        for (let i = confetti.length - 1; i >= 0; i--) {
+          const c = confetti[i];
+          c.x += c.vx;
+          c.y += c.vy;
+          c.rot += c.rotSpeed;
+          if (c.y > canvas.height + 20) confetti.splice(i, 1);
+        }
+        return;
+      }
+
+      // ゲームオーバー時は停止
+      if (gameState === STATE_GAMEOVER) return;
+
+      // タイムカウント（最長30秒）
+      gameTime += dt;
+      if (gameTime >= MAX_TIME) {
+        gameTime = MAX_TIME;
+        gameState = STATE_CLEAR;
+        enemyBullets = []; // 敵弾を一掃
+        for (let i = 0; i < 5; i++) spawnFirework(); // 開始時にド派手に発火
+        return;
+      }
+
+      // 自機の左右移動
+      if (keys.ArrowLeft) player.x -= player.speed;
+      if (keys.ArrowRight) player.x += player.speed;
+      if (player.x < 0) player.x = 0;
+      if (player.x + player.width > canvas.width) player.x = canvas.width - player.width;
+
+      // 自機の弾発射（スペースキー）
+      playerShootCooldown -= dt;
+      if ((keys.Space || autoFire) && playerShootCooldown <= 0) {
+        playerBullets.push({
+          x: player.x + player.width / 2,
+          y: player.y,
+          vy: -10,
+          radius: 3
+        });
+        playerShootCooldown = 0.12; // 連射間隔
+      }
+
+      // 自機の弾の移動
+      for (let i = playerBullets.length - 1; i >= 0; i--) {
+        const b = playerBullets[i];
+        b.y += b.vy;
+        if (b.y < -10) playerBullets.splice(i, 1);
+      }
+
+      // ボスの左右移動
+      boss.x += boss.vx;
+      if (boss.x < 80 || boss.x > canvas.width - 80) boss.vx *= -1;
+
+      // 弾幕生成ロジック（時間帯で難易度変化）
+      shootTimer += dt;
+      const playerCenterX = player.x + player.width / 2;
+      const playerCenterY = player.y + player.height / 2;
+
+      // === 第1段階: 0〜10秒（避けやすい） ===
+      if (gameTime < 10) {
+        if (shootTimer >= 0.5) {
+          shootTimer = 0;
+          // 自機狙い弾（低速）
+          const dx = playerCenterX - boss.x;
+          const dy = playerCenterY - boss.y;
+          const dist = Math.hypot(dx, dy);
+          const speed = 3.2;
+          spawnEnemyBullet(boss.x, boss.y, (dx / dist) * speed, (dy / dist) * speed, '#38bdf8', 5);
+
+          // 左右へのゆったりした拡散弾
+          spawnEnemyBullet(boss.x, boss.y, ((dx / dist) * speed) - 1, (dy / dist) * speed, '#60a5fa', 4);
+          spawnEnemyBullet(boss.x, boss.y, ((dx / dist) * speed) + 1, (dy / dist) * speed, '#60a5fa', 4);
+        }
+      }
+      // === 第2段階: 10〜20秒（やや避けにくい） ===
+      else if (gameTime < 20) {
+        if (shootTimer >= 0.22) {
+          shootTimer = 0;
+          // 5方向の扇状弾幕
+          const baseAngle = Math.atan2(playerCenterY - boss.y, playerCenterX - boss.x);
+          const speed = 3.8;
+          for (let i = -2; i <= 2; i++) {
+            const angle = baseAngle + i * 0.28;
+            spawnEnemyBullet(
+              boss.x,
+              boss.y,
+              Math.cos(angle) * speed,
+              Math.sin(angle) * speed,
+              '#f59e0b',
+              5
+            );
+          }
+        }
+        // 天井からのランダム落下弾
+        if (Math.random() < 0.12) {
+          spawnEnemyBullet(Math.random() * canvas.width, 0, 0, 2.2 + Math.random() * 1.5, '#fbbf24', 4);
+        }
+      }
+      // === 第3段階: 20〜30秒（鬼モード） ===
+      else {
+        // 高速回転スパイラル弾幕（毎フレーム展開）
+        spiralAngle += 0.28;
+        if (shootTimer >= 0.08) {
+          shootTimer = 0;
+          const speed = 3.6;
+          // 2重螺旋弾幕
+          spawnEnemyBullet(boss.x, boss.y, Math.cos(spiralAngle) * speed, Math.sin(spiralAngle) * speed, '#ef4444', 5);
+          spawnEnemyBullet(boss.x, boss.y, Math.cos(spiralAngle + Math.PI) * speed, Math.sin(spiralAngle + Math.PI) * speed, '#f43f5e', 5);
+
+          // 自機狙い高速レーザー風連射弾
+          if (Math.random() < 0.4) {
+            const dx = playerCenterX - boss.x;
+            const dy = playerCenterY - boss.y;
+            const dist = Math.hypot(dx, dy);
+            const highSpeed = 5.2;
+            spawnEnemyBullet(boss.x, boss.y, (dx / dist) * highSpeed, (dy / dist) * highSpeed, '#ec4899', 4);
+          }
+        }
+      }
+
+      // 敵弾の移動と当たり判定
+      for (let i = enemyBullets.length - 1; i >= 0; i--) {
+        const b = enemyBullets[i];
+        b.x += b.vx;
+        b.y += b.vy;
+
+        // 画面外で消去
+        if (b.x < -20 || b.x > canvas.width + 20 || b.y < -20 || b.y > canvas.height + 20) {
+          enemyBullets.splice(i, 1);
+          continue;
+        }
+
+        // 自機のコアとの当たり判定（円形判定）
+        const dist = Math.hypot(b.x - playerCenterX, b.y - playerCenterY);
+        if (dist < b.radius + player.hitRadius) {
+          gameState = STATE_GAMEOVER;
+          break;
+        }
+      }
+    }
+
+    // 描画処理
+    function draw() {
+      // 画面クリア
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // 背景のグリッド風装飾
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.03)';
+      ctx.lineWidth = 1;
+      for (let x = 0; x < canvas.width; x += 40) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+      for (let y = 0; y < canvas.height; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+
+      // 敵ボスの描画
+      ctx.fillStyle = gameTime < 10 ? '#38bdf8' : gameTime < 20 ? '#f59e0b' : '#ef4444';
+      ctx.fillRect(boss.x - boss.width / 2, boss.y - boss.height / 2, boss.width, boss.height);
+      // ボスコア
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(boss.x - 6, boss.y - 6, 12, 12);
+
+      // 自機の描画（白い四角）
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(player.x, player.y, player.width, player.height);
+      // 自機中央の赤い当たり判定コア（弾幕STGらしさ）
+      ctx.fillStyle = '#ef4444';
+      ctx.beginPath();
+      ctx.arc(player.x + player.width / 2, player.y + player.height / 2, player.hitRadius, 0, Math.PI * 2);
+      ctx.fill();
+
+      // 自機の弾の描画
+      ctx.fillStyle = '#67e8f9';
+      for (const b of playerBullets) {
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 敵弾の描画
+      for (const b of enemyBullets) {
+        ctx.fillStyle = b.color;
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // UI: タイマーと現在の難易度表示
+      const remainingTime = Math.max(0, MAX_TIME - gameTime).toFixed(1);
+      ctx.font = 'bold 20px monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'left';
+      ctx.fillText(`TIME: ${remainingTime}s`, 16, 32);
+
+      // 難易度フェーズ表示
+      ctx.font = 'bold 14px sans-serif';
+      if (gameTime < 10) {
+        ctx.fillStyle = '#38bdf8';
+        ctx.fillText('PHASE 1: 避けやすい', 16, 52);
+      } else if (gameTime < 20) {
+        ctx.fillStyle = '#f59e0b';
+        ctx.fillText('PHASE 2: やや避けにくい', 16, 52);
+      } else {
+        ctx.fillStyle = '#ef4444';
+        ctx.fillText('PHASE 3: 鬼（耐えろ！）', 16, 52);
+      }
+
+      // 30秒耐えきった場合の派手な祝勝演出
+      if (gameState === STATE_CLEAR) {
+        // 花火パーティクル描画
+        for (const f of fireworks) {
+          ctx.save();
+          ctx.globalAlpha = f.alpha;
+          ctx.fillStyle = f.color;
+          ctx.beginPath();
+          ctx.arc(f.x, f.y, 3, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        // 紙吹雪描画
+        for (const c of confetti) {
+          ctx.save();
+          ctx.translate(c.x, c.y);
+          ctx.rotate((c.rot * Math.PI) / 180);
+          ctx.fillStyle = c.color;
+          ctx.fillRect(-c.w / 2, -c.h / 2, c.w, c.h);
+          ctx.restore();
+        }
+
+        // お祝いテキスト表示
+        ctx.textAlign = 'center';
+        ctx.font = '900 36px sans-serif';
+        ctx.fillStyle = '#fde047';
+        ctx.shadowColor = '#eab308';
+        ctx.shadowBlur = 20;
+        ctx.fillText('🎉 30秒完走！CLEAR!! 🎉', canvas.width / 2, 280);
+        ctx.shadowBlur = 0;
+
+        ctx.font = 'bold 22px sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('おめでとうございます！！', canvas.width / 2, 330);
+
+        ctx.font = '16px sans-serif';
+        ctx.fillStyle = '#cbd5e1';
+        ctx.fillText('タップ / Enterキーで最初からやり直す', canvas.width / 2, 380);
+      }
+
+      // ゲームオーバー時の表示
+      if (gameState === STATE_GAMEOVER) {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.65)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        ctx.textAlign = 'center';
+        ctx.font = 'bold 36px sans-serif';
+        ctx.fillStyle = '#ef4444';
+        ctx.fillText('GAME OVER', canvas.width / 2, 280);
+
+        ctx.font = '18px sans-serif';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(`生存時間: ${gameTime.toFixed(1)} 秒`, canvas.width / 2, 330);
+
+        ctx.font = '15px sans-serif';
+        ctx.fillStyle = '#94a3b8';
+        ctx.fillText('タップ / Enterキーですぐにやり直せます', canvas.width / 2, 380);
+      }
+    }
+
+    // メインループ
+    function gameLoop(timestamp) {
+      const dt = Math.min((timestamp - lastTimestamp) / 1000, 0.1);
+      lastTimestamp = timestamp;
+
+      update(dt);
+      draw();
+
+      requestAnimationFrame(gameLoop);
+    }
+
+    // 初回起動
+    requestAnimationFrame((timestamp) => {
+      lastTimestamp = timestamp;
+      gameLoop(timestamp);
+    });
+  </script>
+</body>
+</html>
